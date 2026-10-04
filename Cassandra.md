@@ -171,6 +171,25 @@ You cannot insert arbitrary, varying‑shape documents in Cassandra the way you 
 
 In Cassandra, the primary key consists of two parts: the **partition key** and the **clustering key**. The partition key determines how data is distributed across the cluster—each node is assigned a token range via a partitioner hashing function, and rows with the same partition key always go to the same node. The clustering key determines how data is physically sorted and stored within a single node; rows with the same partition key are stored together and sorted by their clustering key values.
 
+## Cassandra Data Modeling Summary
+
+Cassandra data modeling is **query-first**. Start with the exact reads and writes your application needs, then design tables around those access patterns.
+
+**Main rules:**
+- Define your queries first, then build the tables.
+- Avoid joins; duplicate or denormalize data when needed.
+- Choose a partition key that spreads data evenly across the cluster.
+- Keep partitions reasonably sized, often around 10 MB to 100 MB.
+
+**Simple example:** if an app needs to show orders by user and also orders by status, Cassandra often uses two tables instead of one joined query.
+
+| Table | Purpose | Example key |
+| --- | --- | --- |
+| `orders_by_user` | Fetch all orders for one user | `PRIMARY KEY ((user_id), order_date)` |
+| `orders_by_status` | Fetch all pending orders | `PRIMARY KEY ((status), order_date)` |
+
+This duplication is normal in Cassandra because it avoids joins and keeps reads fast.
+
 
 ## Primary key = Partition key + Clustering key
 
@@ -383,6 +402,37 @@ AND score=4;
 
 ```
 
+
+
+
+```
+CREATE TABLE books (
+  book_id text,
+  chapter_no int,
+  chapter_text text,
+  PRIMARY KEY ((book_id), chapter_no)
+);
+Here:
+
+book_id = 'B1' is one partition
+that partition can have many rows, one per chapter_no
+If you want only one row per book
+
+CREATE TABLE books (
+  book_id text PRIMARY KEY,
+  title text,
+  author text
+);
+
+In that design, each book_id maps to exactly one row.
+
+So the answer is:
+
+Partition key alone does not imply one row
+Partition key with no clustering columns usually gives one row per key
+Partition key with clustering columns can give many rows per key
+
+```
 
 ### Cassandra Complex Data Types Summary:
 
@@ -1167,9 +1217,9 @@ seed_provider:
 
 ## Production Network Configuration
 
-### listen_address, rpc_address, and rpc_port in Production
+### listen_address, storage_port, rpc_address, and native_transport_port in Production
 
-In a production Cassandra cluster, these three properties control how nodes communicate with each other and with clients. Understanding their roles is critical for proper cluster setup.
+In a production Cassandra cluster, these settings control how nodes communicate with each other and with clients. The important distinction is that `listen_address` and `rpc_address` are IP/hostname settings, while `storage_port` and `native_transport_port` are port settings.
 
 #### listen_address: Inter-Node Communication
 
@@ -1199,6 +1249,33 @@ listen_address: localhost  # Other nodes cannot reach this node!
 listen_address: 192.168.1.100  # Actual IP; all nodes can reach it
 ```
 
+**Important clarification:** `listen_address` is only the address part. The full inter-node endpoint is effectively:
+
+```yaml
+listen_address: 192.168.1.100
+storage_port: 7000
+```
+
+This means other Cassandra nodes connect to this node at `192.168.1.100:7000` for cluster-internal traffic.
+
+#### storage_port: Inter-Node Port
+
+**Purpose:** Port used for **node-to-node communication**.
+
+**Used for:**
+- Gossip protocol
+- Replica-to-replica and coordinator-to-replica communication
+- Internal cluster traffic
+
+**Production Configuration:**
+```yaml
+storage_port: 7000
+```
+
+So:
+- `listen_address` answers: "Which IP should other nodes use to reach me?"
+- `storage_port` answers: "Which port on that IP should they use?"
+
 #### rpc_address: Client Communication
 
 **Purpose:** IP address/hostname that Cassandra binds to for **client-to-node communication** (application traffic)
@@ -1219,7 +1296,7 @@ listen_address: 192.168.1.100  # Actual IP; all nodes can reach it
 
 **Note:** `rpc_address: 0.0.0.0` means "listen on all network interfaces" (most flexible in production)
 
-#### rpc_port: Client Connection Port
+#### native_transport_port: Client Connection Port
 
 **Purpose:** Port that Cassandra listens on for client connections
 
@@ -1229,37 +1306,69 @@ listen_address: 192.168.1.100  # Actual IP; all nodes can reach it
 
 **Production Configuration:**
 ```yaml
-rpc_port: 9042  # Native CQL protocol
+native_transport_port: 9042  # Native CQL protocol
 ```
 
+**Note:** Many older tutorials use `rpc_port`, but modern Cassandra client traffic is usually described with `native_transport_port` on port `9042`.
+
 **Firewall Rules (typical production):**
-- Port 7000: Inter-node communication (listen_address)
-- Port 9042: Client communication (rpc_port)
+- Port 7000: Inter-node communication (`listen_address` + `storage_port`)
+- Port 9042: Client communication (`rpc_address` + `native_transport_port`)
 - Block to external IPs; allow only from application servers
+
+### Coordinator Node vs Replica Nodes
+
+This is the part that often causes confusion.
+
+**Coordinator node:**
+- The node that first receives the client request
+- Any Cassandra node can be the coordinator
+- It does not have to own the data
+- It forwards the request to the correct replica nodes and aggregates responses
+
+**Replica nodes:**
+- The nodes that actually store copies of the partition's data
+- Which nodes are replicas depends on the partition key, token ownership, and replication strategy
+- For one query, Node2 and Node3 may be replicas
+- For another query, Node1 might be a replica instead
+
+**Important:** All nodes do **not** need to connect specifically to "the first node in the sequence diagram." Instead:
+- Every node must be reachable by peer nodes on its own `listen_address:storage_port`
+- The client can connect to any node exposed for CQL
+- Whichever node the client contacts becomes the coordinator for that request
 
 ### Sequence Diagram: Production Network Flow
 
 ```mermaid
 sequenceDiagram
     participant Client as Client<br/>(Application)
-    participant Node1 as Cassandra Node1<br/>192.168.1.100:9042
-    participant Node2 as Cassandra Node2<br/>192.168.1.101:7000
-    participant Node3 as Cassandra Node3<br/>192.168.1.102:7000
+    participant Node1 as Cassandra Node1<br/>Coordinator for this request<br/>192.168.1.100:9042 / :7000
+    participant Node2 as Cassandra Node2<br/>Replica node<br/>192.168.1.101:7000
+    participant Node3 as Cassandra Node3<br/>Replica node<br/>192.168.1.102:7000
 
-    Client->>Node1: CQL Query<br/>(rpc_address:rpc_port)
+    Client->>Node1: CQL Query<br/>(rpc_address:native_transport_port)
     Note over Node1: receive on 192.168.1.100:9042
     
-    Node1->>Node2: Gossip/Replication<br/>(listen_address:7000)
+    Node1->>Node2: Forward request to replica<br/>(listen_address:storage_port)
     Note over Node2: receive on 192.168.1.101:7000
     
-    Node2->>Node3: Gossip/Replication<br/>(listen_address:7000)
+    Node1->>Node3: Forward request to replica<br/>(listen_address:storage_port)
     Note over Node3: receive on 192.168.1.102:7000
     
-    Node3->>Node1: Acknowledgment<br/>(listen_address:7000)
+    Node2->>Node1: Acknowledgment / data digest
+    Node3->>Node1: Acknowledgment / data digest
     Note over Node1: receive on 192.168.1.100:7000
     
-    Node1->>Client: Query Result<br/>(rpc_port response)
+    Node1->>Client: Query Result<br/>(native_transport_port response)
 ```
+
+### How to Read the Diagram Correctly
+
+- `Node1` is the **coordinator only for this example request** because the client connected to Node1 first
+- `Node2` and `Node3` are shown as **replicas for this specific partition/request**
+- The diagram does **not** mean all traffic in the cluster must always pass through Node1
+- On a different client request, Node2 or Node3 could become the coordinator
+- Gossip is a continuous peer-to-peer background process among all nodes; it is not limited to the exact request path shown in the diagram
 
 ### Datacenters and Racks: Production Topology
 
@@ -1386,6 +1495,269 @@ Region: eu-west-1 (Disaster Recovery)
 - Write: Data replicated to 3 nodes across 3 AZs in primary region (durable)
 - Read: Quorum read checks 2 nodes (likely same region → low latency)
 - Disaster: If us-east fails, eu-west has replicas (data preserved)
+
+---
+
+## Nodetool Commands
+
+`nodetool` is the command-line utility used to inspect, manage, and maintain a Cassandra node. You run it on the machine where Cassandra is installed, and it talks to the local node using JMX.
+
+### Common Commands
+
+| Command | Purpose | Example |
+| --- | --- | --- |
+| `nodetool status` | Show cluster and node health | `nodetool status` |
+| `nodetool info` | Show node-level details like uptime, load, and tokens | `nodetool info` |
+| `nodetool ring` | Show token ownership and ring layout | `nodetool ring` |
+| `nodetool describecluster` | Show cluster metadata and snitch information | `nodetool describecluster` |
+| `nodetool repair` | Run anti-entropy repair on tables | `nodetool repair mq_events_space` |
+| `nodetool flush` | Flush MemTables to SSTables | `nodetool flush` |
+| `nodetool compact` | Force compaction on SSTables | `nodetool compact mq_events_space contractors` |
+| `nodetool cleanup` | Remove data no longer owned by the node after topology changes | `nodetool cleanup` |
+| `nodetool drain` | Flush writes and stop accepting new traffic before shutdown | `nodetool drain` |
+| `nodetool tpstats` | Show thread pool and request activity | `nodetool tpstats` |
+| `nodetool cfstats` | Show table-level statistics | `nodetool cfstats mq_events_space` |
+| `nodetool gossipinfo` | Show gossip state for the local node | `nodetool gossipinfo` |
+
+### Basic Usage Examples
+
+#### Check cluster health
+
+```bash
+nodetool status
+```
+
+Use this to see whether nodes are `UN` (Up/Normal), `DN` (Down/Normal), and how data is distributed across the ring.
+
+#### Inspect one node
+
+```bash
+nodetool info
+```
+
+This is useful when you want to verify load, uptime, generation number, and token information for the current node.
+
+#### Run repair on a keyspace or table
+
+```bash
+nodetool repair mq_events_space
+```
+
+or for one table:
+
+```bash
+nodetool repair mq_events_space contractors
+```
+
+Use repair when replicas may have diverged and you want Cassandra to reconcile data.
+
+#### Flush MemTables to disk
+
+```bash
+nodetool flush
+```
+
+This forces in-memory writes to be persisted into SSTables. It is often used before maintenance or before checking disk-level artifacts.
+
+#### Force compaction
+
+```bash
+nodetool compact mq_events_space contractors
+```
+
+This merges SSTables and can remove obsolete data and tombstones after the grace period.
+
+#### Remove old data after topology changes
+
+```bash
+nodetool cleanup
+```
+
+Run this after changing replication or moving data so the node removes partitions it no longer owns.
+
+#### Graceful shutdown preparation
+
+```bash
+nodetool drain
+```
+
+This flushes data and prepares the node to stop cleanly without losing recent writes.
+
+### Practical Notes
+
+- `nodetool` usually needs local JMX access, so you run it on the Cassandra server itself or with the right remote JMX configuration.
+- Some commands affect the whole node, while others can target a keyspace or a specific table.
+- For production, use `repair`, `cleanup`, and `compact` carefully because they can be expensive on large clusters.
+
+---
+
+## Java Connector / Adapter with Cassandra
+
+For Spring Boot apps, the easiest way to connect to Cassandra is with Spring Data Cassandra.
+
+### Maven Dependency
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-cassandra</artifactId>
+</dependency>
+```
+
+### application.yml
+
+```yaml
+spring:
+  cassandra:
+    contact-points: 127.0.0.1
+    port: 9042
+    keyspace-name: mq_events_space
+    local-datacenter: datacenter1
+```
+
+### Simple Sample Code
+
+```java
+@Table("contractors")
+public class Contractor {
+    @PrimaryKey
+    private Integer workerId;
+    private String workerName;
+    private Integer workerAge;
+}
+
+public interface ContractorRepository extends CassandraRepository<Contractor, Integer> {
+}
+```
+
+```java
+@Service
+public class ContractorService {
+    private final ContractorRepository repository;
+
+    public ContractorService(ContractorRepository repository) {
+        this.repository = repository;
+    }
+
+    public Contractor save(Contractor contractor) {
+        return repository.save(contractor);
+    }
+}
+```
+
+**Note:** In Spring Boot, the repository layer acts like the adapter between your application and Cassandra.
+
+### Basic CRUD Queries
+
+```sql
+INSERT INTO contractors (worker_id, worker_name, worker_age)
+VALUES (1, 'Alex', 35);
+
+SELECT * FROM contractors WHERE worker_id = 1;
+
+UPDATE contractors SET worker_age = 36 WHERE worker_id = 1;
+
+DELETE FROM contractors WHERE worker_id = 1;
+```
+
+### CRUD with Repository
+
+```java
+@Service
+public class ContractorService {
+    private final ContractorRepository repository;
+
+    public ContractorService(ContractorRepository repository) {
+        this.repository = repository;
+    }
+
+    public Contractor create(Contractor contractor) {
+        return repository.save(contractor);
+    }
+
+    public Contractor read(Integer workerId) {
+        return repository.findById(workerId).orElse(null);
+    }
+
+    public Contractor update(Contractor contractor) {
+        return repository.save(contractor);
+    }
+
+    public void delete(Integer workerId) {
+        repository.deleteById(workerId);
+    }
+}
+```
+
+**Note:** For Cassandra, `save()` works for both insert and update when the primary key is the same.
+
+---
+
+## Cassandra Anti-Patterns
+
+These are common ways to use Cassandra poorly and hurt performance.
+
+### Main Anti-Patterns
+
+- Using Cassandra like a queue, where data is constantly consumed and deleted.
+- Doing too many updates or deletes on the same rows, which creates tombstones.
+- Changing the schema frequently instead of designing tables around known queries.
+- Storing very large data in collections like `list`, `set`, or `map`.
+- Creating wide partitions that grow too large.
+- Storing blobs or text larger than about 1 MB directly in Cassandra.
+- Running queries without the partition key or relying on `ALLOW FILTERING`.
+- Creating too many tables in one cluster.
+- Using `SimpleStrategy` in production instead of `NetworkTopologyStrategy`.
+
+### Quick Rules
+
+| Anti-pattern | Better approach |
+| --- | --- |
+| Queue-like delete-heavy design | Keep data immutable and model for reads |
+| Too many updates/deletes | Minimize churn on the same partition |
+| Frequent schema changes | Design around known query patterns |
+| Large collections | Split data into separate tables |
+| Wide partitions | Keep partitions reasonably small, often under 100 MB |
+| Large blobs | Store large files in S3/HDFS and keep only the reference in Cassandra |
+| `ALLOW FILTERING` queries | Query by partition key or redesign the table |
+| `SimpleStrategy` in production | Use `NetworkTopologyStrategy` |
+
+### Small Examples
+
+**Bad for a queue:**
+
+```sql
+SELECT * FROM jobs WHERE status = 'NEW' ALLOW FILTERING;
+DELETE FROM jobs WHERE job_id = 1;
+```
+
+**Better:** model the table by the exact processing query, for example `jobs_by_status`.
+
+
+
+**Bad for large payloads:**
+
+```sql
+INSERT INTO files (file_id, content_blob) VALUES (1, <very_large_blob>);
+```
+
+**Better:** store the file in object storage and save the URL in Cassandra.
+
+**Bad in production:**
+
+```sql
+CREATE KEYSPACE demo
+WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3};
+```
+
+**Better:** use `NetworkTopologyStrategy` for production clusters.
+
+
+## Cassandra on Cloud
+
+If you want managed Cassandra, common options are **Astra DB** from DataStax, **Amazon Keyspaces** on AWS, and **Azure Managed Instance for Apache Cassandra** on Azure. These services reduce operational work by handling cluster setup, scaling, and much of the maintenance for you, while still giving you a Cassandra-compatible way to store and query data.
+
+
 
 
 
